@@ -1,6 +1,8 @@
 from mcp.server.fastmcp import FastMCP
 import yfinance as yf
 import math
+import datetime
+from duckduckgo_search import DDGS
 
 # 建立 MCP Server 實例
 mcp = FastMCP("stock-analysis-mcp")
@@ -544,6 +546,234 @@ def get_dividend_info(ticker: str) -> str:
         return "\n".join(lines)
     except Exception as e:
         return f"無法分析 {ticker} 的股息: {str(e)}"
+
+
+@mcp.tool()
+def get_earnings_call_summary(ticker: str) -> str:
+    """
+    法說會 / 財報電話會議摘要：整合最新 EPS 達標歷史、分析師共識預估、
+    目標價、評等異動，以及網路搜尋到的法說會 / 財報重點。
+    適用於美股（如 'AAPL'）及台股（如 '2330.TW'）。
+    """
+    try:
+        stock = yf.Ticker(ticker)
+        info = stock.info
+        currency = info.get('currency', 'N/A')
+        name = info.get('longName', ticker)
+        current_price = info.get('currentPrice') or info.get('regularMarketPrice')
+
+        lines = [f"=== {ticker} ({name}) 法說會 / 財報摘要 ===", ""]
+
+        # 區塊 1：下次財報日
+        lines.append("【下次財報日】")
+        try:
+            ts = info.get('earningsTimestampStart') or info.get('earningsTimestamp')
+            if ts:
+                dt = datetime.datetime.fromtimestamp(ts)
+                lines.append(f"  預計: {dt.strftime('%Y-%m-%d')}")
+            else:
+                lines.append("  資料不足")
+        except Exception:
+            lines.append("  資料不足")
+
+        # 區塊 2：近期 EPS 達標歷史（8 季）
+        lines.append("")
+        lines.append("【近期 EPS 達標歷史（最近 8 季）】")
+        try:
+            eh = stock.earnings_history
+            if eh is not None and not eh.empty:
+                recent = eh.tail(8)
+                beat_count = 0
+                total_count = 0
+                for date, row in recent.iterrows():
+                    actual = row.get('epsActual')
+                    estimate = row.get('epsEstimate')
+                    surprise = row.get('surprisePercent')
+                    if actual is None or estimate is None:
+                        continue
+                    total_count += 1
+                    surprise_pct = surprise * 100 if surprise is not None else None
+                    beat = actual >= estimate
+                    if beat:
+                        beat_count += 1
+                    beat_label = "✓ 達標" if beat else "✗ 未達"
+                    surprise_str = f" ({surprise_pct:+.1f}%)" if surprise_pct is not None else ""
+                    try:
+                        date_str = date.strftime('%Y-%m-%d') if hasattr(date, 'strftime') else str(date)[:10]
+                    except Exception:
+                        date_str = str(date)[:10]
+                    lines.append(f"  {date_str}: 實際 {actual:.2f} vs 預估 {estimate:.2f}{surprise_str} {beat_label}")
+                if total_count > 0:
+                    beat_rate = beat_count / total_count * 100
+                    lines.append(f"  → 達標率: {beat_count}/{total_count} ({beat_rate:.0f}%)")
+            else:
+                lines.append("  資料不足")
+        except Exception as e:
+            lines.append(f"  資料不足: {str(e)}")
+
+        # 區塊 3：分析師共識預估（EPS + 營收）
+        lines.append("")
+        lines.append("【分析師共識預估】")
+        try:
+            ee = stock.earnings_estimate
+            if ee is not None and not ee.empty:
+                lines.append("  EPS 預估:")
+                label_map = {'0q': '本季', '+1q': '下季', '0y': '本年', '+1y': '明年'}
+                for period in ['0q', '+1q', '0y', '+1y']:
+                    if period in ee.index:
+                        row = ee.loc[period]
+                        avg = row.get('avg')
+                        growth = row.get('growth')
+                        n = row.get('numberOfAnalysts')
+                        if avg is not None:
+                            growth_str = f", YoY {growth * 100:+.1f}%" if growth is not None else ""
+                            n_str = f", {int(n)} 位分析師" if n is not None else ""
+                            lines.append(f"    {label_map.get(period, period)}: {avg:.2f} {currency}{growth_str}{n_str}")
+            else:
+                lines.append("  EPS 預估: 資料不足")
+        except Exception as e:
+            lines.append(f"  EPS 預估資料不足: {str(e)}")
+
+        try:
+            re = stock.revenue_estimate
+            if re is not None and not re.empty:
+                lines.append("  營收預估:")
+                label_map = {'0q': '本季', '+1q': '下季', '0y': '本年', '+1y': '明年'}
+                for period in ['0q', '+1q', '0y', '+1y']:
+                    if period in re.index:
+                        row = re.loc[period]
+                        avg = row.get('avg')
+                        growth = row.get('growth')
+                        n = row.get('numberOfAnalysts')
+                        if avg is not None:
+                            if abs(avg) >= 1e9:
+                                avg_str = f"{avg / 1e9:.2f}B"
+                            elif abs(avg) >= 1e6:
+                                avg_str = f"{avg / 1e6:.2f}M"
+                            else:
+                                avg_str = f"{avg:.0f}"
+                            growth_str = f", YoY {growth * 100:+.1f}%" if growth is not None else ""
+                            n_str = f", {int(n)} 位分析師" if n is not None else ""
+                            lines.append(f"    {label_map.get(period, period)}: {avg_str} {currency}{growth_str}{n_str}")
+        except Exception as e:
+            lines.append(f"  營收預估資料不足: {str(e)}")
+
+        # 區塊 4：分析師目標價
+        lines.append("")
+        lines.append("【分析師目標價】")
+        try:
+            apt = stock.analyst_price_targets
+            if apt is not None:
+                mean_target = apt.get('mean')
+                high_target = apt.get('high')
+                low_target = apt.get('low')
+                if mean_target:
+                    lines.append(f"  共識目標價: {mean_target:.2f} {currency}")
+                if high_target:
+                    lines.append(f"  樂觀目標價: {high_target:.2f} {currency}")
+                if low_target:
+                    lines.append(f"  保守目標價: {low_target:.2f} {currency}")
+                if mean_target and current_price:
+                    upside = (mean_target - current_price) / current_price * 100
+                    upside_label = "潛在上漲空間" if upside > 0 else "潛在下跌空間"
+                    lines.append(f"  現價 → 共識目標: {upside:+.1f}% ({upside_label})")
+            else:
+                lines.append("  資料不足")
+        except Exception as e:
+            lines.append(f"  資料不足: {str(e)}")
+
+        # 區塊 5：近 90 天分析師評等異動
+        lines.append("")
+        lines.append("【近 90 天分析師評等異動】")
+        try:
+            ud = stock.upgrades_downgrades
+            if ud is not None and not ud.empty:
+                cutoff = datetime.datetime.now() - datetime.timedelta(days=90)
+                # index is GradeDate
+                if hasattr(ud.index, 'tz_convert'):
+                    ud.index = ud.index.tz_convert(None)
+                elif hasattr(ud.index, 'tz_localize'):
+                    ud.index = ud.index.tz_localize(None)
+                recent_ud = ud[ud.index >= cutoff]
+                if not recent_ud.empty:
+                    for date, row in recent_ud.iterrows():
+                        firm = row.get('Firm', 'N/A')
+                        action = row.get('Action', '')
+                        to_grade = row.get('ToGrade', '')
+                        from_grade = row.get('FromGrade', '')
+                        try:
+                            date_str = date.strftime('%Y-%m-%d')
+                        except Exception:
+                            date_str = str(date)[:10]
+                        if from_grade:
+                            lines.append(f"  {date_str} [{firm}] {action}: {from_grade} → {to_grade}")
+                        else:
+                            lines.append(f"  {date_str} [{firm}] {action}: {to_grade}")
+                else:
+                    lines.append("  近 90 天無評等異動記錄（台股此資料通常為空）")
+            else:
+                lines.append("  無評等異動資料（台股此資料通常為空）")
+        except Exception as e:
+            lines.append(f"  資料不足: {str(e)}")
+
+        # 區塊 6：DuckDuckGo 搜尋結果
+        lines.append("")
+        lines.append("【網路搜尋：法說會 / 財報重點】")
+        try:
+            year = datetime.datetime.now().year
+            is_taiwan = ticker.upper().endswith('.TW') or ticker.upper().endswith('.TWO')
+            ticker_base = ticker.split('.')[0]
+
+            queries = []
+            if is_taiwan:
+                queries = [
+                    f"{ticker_base} 法說會 {year}",
+                    f"{name} earnings call {year}",
+                    f"{ticker_base} 財報 法人說明會 {year}",
+                ]
+            else:
+                queries = [
+                    f'"{name}" earnings call highlights {year}',
+                    f'"{ticker}" earnings call transcript {year}',
+                ]
+
+            seen_urls = set()
+            results = []
+            ddgs = DDGS()
+            for query in queries:
+                try:
+                    hits = ddgs.text(query, max_results=5)
+                    for hit in hits:
+                        url = hit.get('href', '')
+                        if url and url not in seen_urls:
+                            seen_urls.add(url)
+                            results.append(hit)
+                        if len(results) >= 8:
+                            break
+                except Exception:
+                    continue
+                if len(results) >= 8:
+                    break
+
+            if results:
+                for i, r in enumerate(results[:8], 1):
+                    title = r.get('title', '無標題')
+                    url = r.get('href', '')
+                    body = r.get('body', '')
+                    if len(body) > 300:
+                        body = body[:300] + "..."
+                    lines.append(f"  {i}. {title}")
+                    lines.append(f"     {url}")
+                    if body:
+                        lines.append(f"     {body}")
+            else:
+                lines.append("  未找到相關搜尋結果")
+        except Exception as e:
+            lines.append(f"  搜尋失敗（網路問題或服務不可用）: {str(e)}")
+
+        return "\n".join(lines)
+    except Exception as e:
+        return f"無法取得 {ticker} 的法說會摘要: {str(e)}"
 
 
 @mcp.tool()
