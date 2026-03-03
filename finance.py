@@ -2,6 +2,7 @@ from mcp.server.fastmcp import FastMCP
 import yfinance as yf
 import math
 import datetime
+import httpx
 from duckduckgo_search import DDGS
 
 # 建立 MCP Server 實例
@@ -774,6 +775,322 @@ def get_earnings_call_summary(ticker: str) -> str:
         return "\n".join(lines)
     except Exception as e:
         return f"無法取得 {ticker} 的法說會摘要: {str(e)}"
+
+
+@mcp.tool()
+def get_institutional_trading(ticker: str) -> str:
+    """
+    機構法人買賣超與持股概況。
+    台股 (.TW/.TWO)：三大法人（外資、投信、自營商）近 5 日買賣超明細與趨勢。
+    美股：機構法人持股比例、前十大機構股東、前五大共同基金。
+    例如: 'AAPL', '2330.TW', '6667.TWO'
+    """
+    try:
+        stock = yf.Ticker(ticker)
+        info = stock.info
+        name = info.get('longName', ticker)
+        is_tw = ticker.upper().endswith('.TW')
+        is_two = ticker.upper().endswith('.TWO')
+        is_taiwan = is_tw or is_two
+        ticker_base = ticker.split('.')[0]
+
+        lines = [f"=== {ticker} ({name}) 機構法人持股概況 ===", ""]
+
+        if is_taiwan:
+            # 區塊 1：主要持股概況（yfinance）
+            lines.append("【主要持股概況（yfinance）】")
+            try:
+                mh = stock.major_holders
+                if mh is not None and not mh.empty:
+                    def get_mh_value(key):
+                        if key in mh.index:
+                            return mh.loc[key].iloc[0]
+                        return None
+
+                    inst_pct = get_mh_value('institutionsPercentHeld')
+                    insider_pct = get_mh_value('insidersPercentHeld')
+                    inst_count = get_mh_value('institutionsCount')
+
+                    if inst_pct is not None:
+                        lines.append(f"  機構整體持股: {float(inst_pct) * 100:.2f}%")
+                    if insider_pct is not None:
+                        lines.append(f"  內部人持股: {float(insider_pct) * 100:.2f}%")
+                    if inst_count is not None:
+                        lines.append(f"  機構家數: {int(float(inst_count))}")
+                else:
+                    lines.append("  資料不足")
+            except Exception:
+                lines.append("  資料不足")
+            lines.append("  ※ 大戶持股比（400張以上）請參考集保所持股分散表，無免費 API")
+
+            # 區塊 2：三大法人近 5 日買賣超
+            lines.append("")
+            lines.append("【三大法人近 5 日買賣超】")
+            try:
+                def get_recent_weekdays(n=15):
+                    days = []
+                    d = datetime.date.today()
+                    while len(days) < n:
+                        if d.weekday() < 5:
+                            days.append(d)
+                        d -= datetime.timedelta(days=1)
+                    return days
+
+                recent_dates = get_recent_weekdays(15)
+                trading_data = []
+
+                if is_tw:
+                    for d in recent_dates:
+                        if len(trading_data) >= 5:
+                            break
+                        date_str = d.strftime('%Y%m%d')
+                        url = f"https://www.twse.com.tw/rwd/zh/fund/T86?response=json&date={date_str}&selectType=ALL"
+                        try:
+                            resp = httpx.get(url, timeout=8, headers={"User-Agent": "Mozilla/5.0"})
+                            data = resp.json()
+                            if data.get('stat') != 'OK':
+                                continue
+                            fields = data.get('fields', [])
+                            rows = data.get('data', [])
+
+                            def find_field_idx(keywords):
+                                for i, f in enumerate(fields):
+                                    if all(k in f for k in keywords):
+                                        return i
+                                return None
+
+                            foreign_idx = find_field_idx(['外資及陸資', '買賣超'])
+                            trust_idx = find_field_idx(['投信', '買賣超'])
+                            dealer_idx = find_field_idx(['自營商(自行買賣)', '買賣超'])
+                            total_idx = find_field_idx(['三大法人', '買賣超'])
+                            if total_idx is None:
+                                total_idx = find_field_idx(['三大法人'])
+
+                            if None in (foreign_idx, trust_idx, dealer_idx):
+                                continue
+
+                            found_row = None
+                            for row in rows:
+                                if row and row[0] == ticker_base:
+                                    found_row = row
+                                    break
+                            if found_row is None:
+                                continue
+
+                            def parse_val(v):
+                                v = str(v).strip()
+                                if not v or v == '-':
+                                    return None
+                                return int(v.replace(',', ''))
+
+                            foreign = parse_val(found_row[foreign_idx]) if foreign_idx < len(found_row) else None
+                            trust = parse_val(found_row[trust_idx]) if trust_idx < len(found_row) else None
+                            dealer = parse_val(found_row[dealer_idx]) if dealer_idx < len(found_row) else None
+                            total = parse_val(found_row[total_idx]) if total_idx is not None and total_idx < len(found_row) else None
+
+                            if None in (foreign, trust, dealer):
+                                continue
+                            if total is None:
+                                total = foreign + trust + dealer
+
+                            trading_data.append((d.strftime('%Y-%m-%d'), foreign, trust, dealer, total))
+                        except Exception:
+                            continue
+                else:
+                    # TPEX OpenAPI (.TWO)
+                    for d in recent_dates:
+                        if len(trading_data) >= 5:
+                            break
+                        date_str = d.strftime('%Y/%m/%d')
+                        url = f"https://www.tpex.org.tw/openapi/v1/tpex_3insti_daily_trading?date={date_str}"
+                        try:
+                            resp = httpx.get(url, timeout=8, headers={"User-Agent": "Mozilla/5.0"})
+                            data = resp.json()
+                            if not isinstance(data, list):
+                                continue
+
+                            found_row = None
+                            for item in data:
+                                if item.get('Code') == ticker_base:
+                                    found_row = item
+                                    break
+                            if found_row is None:
+                                continue
+
+                            def parse_tpex_val(v):
+                                if v is None:
+                                    return None
+                                v = str(v).strip()
+                                if not v or v == '-':
+                                    return None
+                                return int(v.replace(',', ''))
+
+                            foreign = parse_tpex_val(found_row.get('Foreign_Investor_Net'))
+                            trust = parse_tpex_val(found_row.get('Investment_Trust_Net'))
+                            dealer = parse_tpex_val(found_row.get('Dealer_Net'))
+                            total = parse_tpex_val(found_row.get('Total_Net'))
+
+                            if None in (foreign, trust, dealer):
+                                continue
+                            if total is None:
+                                total = foreign + trust + dealer
+
+                            trading_data.append((d.strftime('%Y-%m-%d'), foreign, trust, dealer, total))
+                        except Exception:
+                            continue
+
+                if trading_data:
+                    lines.append(f"  {'日期':<12} {'外資':>12} {'投信':>10} {'自營商':>10} {'三大法人合計':>14}")
+                    lines.append("  " + "-" * 62)
+
+                    def fmt_val(v):
+                        sign = '+' if v >= 0 else ''
+                        return f"{sign}{v:,}"
+
+                    sum_foreign = sum_trust = sum_dealer = sum_total = 0
+                    for date_str, foreign, trust, dealer, total in trading_data:
+                        lines.append(f"  {date_str:<12} {fmt_val(foreign):>12} {fmt_val(trust):>10} {fmt_val(dealer):>10} {fmt_val(total):>14}")
+                        sum_foreign += foreign
+                        sum_trust += trust
+                        sum_dealer += dealer
+                        sum_total += total
+
+                    lines.append("  " + "-" * 62)
+                    lines.append(f"  5日累計：外資 {fmt_val(sum_foreign)} | 投信 {fmt_val(sum_trust)} | 自營 {fmt_val(sum_dealer)} | 合計 {fmt_val(sum_total)}")
+
+                    totals = [row[4] for row in trading_data]
+                    if all(t > 0 for t in totals):
+                        trend = f"法人連買 {len(totals)} 日"
+                    elif all(t < 0 for t in totals):
+                        trend = f"法人連賣 {len(totals)} 日"
+                    else:
+                        buy_days = sum(1 for t in totals if t > 0)
+                        sell_days = sum(1 for t in totals if t < 0)
+                        trend = f"混合（買超 {buy_days} 日 / 賣超 {sell_days} 日）"
+                    lines.append(f"  趨勢：{trend}")
+                else:
+                    lines.append("  近期無三大法人買賣超資料（可能因假日或 API 暫時無法取得）")
+            except Exception as e:
+                lines.append(f"  三大法人資料取得失敗: {str(e)}")
+
+            # 區塊 3：外資持股比補充
+            lines.append("")
+            lines.append("【外資持股比（yfinance）】")
+            try:
+                held_pct = info.get('heldPercentInstitutions')
+                if held_pct is not None:
+                    lines.append(f"  機構/外資持股比: {held_pct * 100:.2f}%")
+                else:
+                    lines.append("  資料不足")
+            except Exception:
+                lines.append("  資料不足")
+
+        else:
+            # 【美股路徑】
+
+            # 區塊 1：主要持股比例
+            lines.append("【主要持股比例】")
+            try:
+                mh = stock.major_holders
+                if mh is not None and not mh.empty:
+                    def get_mh_value(key):
+                        if key in mh.index:
+                            return mh.loc[key].iloc[0]
+                        return None
+
+                    inst_pct = get_mh_value('institutionsPercentHeld')
+                    insider_pct = get_mh_value('insidersPercentHeld')
+                    inst_float_pct = get_mh_value('institutionsFloatPercentHeld')
+                    inst_count = get_mh_value('institutionsCount')
+
+                    if inst_pct is not None:
+                        lines.append(f"  機構持股: {float(inst_pct) * 100:.2f}%")
+                    if insider_pct is not None:
+                        lines.append(f"  內部人持股: {float(insider_pct) * 100:.2f}%")
+                    if inst_float_pct is not None:
+                        lines.append(f"  機構持浮動股比: {float(inst_float_pct) * 100:.2f}%")
+                    if inst_count is not None:
+                        lines.append(f"  機構家數: {int(float(inst_count))}")
+                else:
+                    lines.append("  資料不足")
+            except Exception:
+                lines.append("  資料不足")
+
+            # 區塊 2：前十大機構股東
+            lines.append("")
+            lines.append("【前十大機構股東】")
+            try:
+                ih = stock.institutional_holders
+                if ih is not None and not ih.empty:
+                    if 'pctHeld' in ih.columns:
+                        ih = ih.sort_values('pctHeld', ascending=False)
+                    top10 = ih.head(10)
+                    for _, row in top10.iterrows():
+                        holder = row.get('Holder', 'N/A')
+                        pct = row.get('pctHeld')
+                        shares = row.get('Shares')
+                        pct_change = row.get('pctChange')
+
+                        pct_str = f"{float(pct) * 100:.2f}%" if pct is not None else "N/A"
+                        shares_str = ""
+                        if shares is not None:
+                            s = float(shares)
+                            if abs(s) >= 1e9:
+                                shares_str = f" ({s/1e9:.2f}B 股)"
+                            elif abs(s) >= 1e6:
+                                shares_str = f" ({s/1e6:.2f}M 股)"
+                            else:
+                                shares_str = f" ({int(s):,} 股)"
+                        change_str = ""
+                        if pct_change is not None:
+                            chg = float(pct_change) * 100
+                            arrow = "▲" if chg > 0 else ("▼" if chg < 0 else "—")
+                            change_str = f" {arrow}{abs(chg):.1f}%"
+                        lines.append(f"  {holder}: {pct_str}{shares_str}{change_str}")
+                else:
+                    lines.append("  資料不足")
+            except Exception as e:
+                lines.append(f"  資料不足: {str(e)}")
+
+            # 區塊 3：前五大共同基金
+            lines.append("")
+            lines.append("【前五大共同基金】")
+            try:
+                mfh = stock.mutualfund_holders
+                if mfh is not None and not mfh.empty:
+                    if 'pctHeld' in mfh.columns:
+                        mfh = mfh.sort_values('pctHeld', ascending=False)
+                    top5 = mfh.head(5)
+                    for _, row in top5.iterrows():
+                        holder = row.get('Holder', 'N/A')
+                        pct = row.get('pctHeld')
+                        shares = row.get('Shares')
+                        pct_change = row.get('pctChange')
+
+                        pct_str = f"{float(pct) * 100:.2f}%" if pct is not None else "N/A"
+                        shares_str = ""
+                        if shares is not None:
+                            s = float(shares)
+                            if abs(s) >= 1e9:
+                                shares_str = f" ({s/1e9:.2f}B 股)"
+                            elif abs(s) >= 1e6:
+                                shares_str = f" ({s/1e6:.2f}M 股)"
+                            else:
+                                shares_str = f" ({int(s):,} 股)"
+                        change_str = ""
+                        if pct_change is not None:
+                            chg = float(pct_change) * 100
+                            arrow = "▲" if chg > 0 else ("▼" if chg < 0 else "—")
+                            change_str = f" {arrow}{abs(chg):.1f}%"
+                        lines.append(f"  {holder}: {pct_str}{shares_str}{change_str}")
+                else:
+                    lines.append("  資料不足")
+            except Exception as e:
+                lines.append(f"  資料不足: {str(e)}")
+
+        return "\n".join(lines)
+    except Exception as e:
+        return f"無法取得 {ticker} 的機構法人資料: {str(e)}"
 
 
 @mcp.tool()
