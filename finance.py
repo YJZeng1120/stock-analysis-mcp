@@ -1094,6 +1094,380 @@ def get_institutional_trading(ticker: str) -> str:
 
 
 @mcp.tool()
+def get_volume_analysis(ticker: str) -> str:
+    """
+    交易量與散戶/法人參與率分析。
+    包含：成交量概況、換手率、持股結構（機構/散戶估算）、台股三大法人日參與率、空頭比率、散戶集中度評估。
+    例如: 'AAPL', '2330.TW', '6667.TWO'
+    """
+    try:
+        stock = yf.Ticker(ticker)
+        info = stock.info
+        name = info.get('longName', ticker)
+        is_tw = ticker.upper().endswith('.TW')
+        is_two = ticker.upper().endswith('.TWO')
+        is_taiwan = is_tw or is_two
+        ticker_base = ticker.split('.')[0]
+
+        lines = [f"=== {ticker} ({name}) 交易量與散戶/法人分析 ===", ""]
+
+        # 【交易量概況】
+        lines.append("【交易量概況】")
+        hist_60 = None
+        ma10_vol = None
+        try:
+            hist_60 = stock.history(period="60d")
+            if hist_60 is not None and not hist_60.empty and 'Volume' in hist_60.columns:
+                vol = hist_60['Volume']
+                latest_vol = float(vol.iloc[-1])
+                ma10_vol = float(vol.tail(10).mean())
+                ma60_vol = float(vol.mean())
+                vol_ratio = latest_vol / ma10_vol if ma10_vol > 0 else None
+
+                def fmt_vol(v):
+                    if v >= 1e8:
+                        return f"{v / 1e8:.2f}億"
+                    elif v >= 1e4:
+                        return f"{v / 1e4:.0f}萬"
+                    return f"{v:,.0f}"
+
+                lines.append(f"  最近一日成交量: {fmt_vol(latest_vol)}")
+                lines.append(f"  10 日均量: {fmt_vol(ma10_vol)}")
+                lines.append(f"  60 日均量: {fmt_vol(ma60_vol)}")
+
+                if vol_ratio is not None:
+                    if vol_ratio > 1.5:
+                        vol_state = "爆量 ⚡"
+                    elif vol_ratio < 0.5:
+                        vol_state = "縮量 ↓"
+                    else:
+                        vol_state = "正常"
+                    lines.append(f"  量比 (近日/10日均): {vol_ratio:.2f}x → {vol_state}")
+
+                float_shares = info.get('floatShares')
+                if float_shares and float_shares > 0 and ma10_vol > 0:
+                    turnover_daily = ma10_vol / float_shares * 100
+                    turnover_monthly = turnover_daily * 21
+                    lines.append(f"  換手率估算（10日均量/流通股）: {turnover_daily:.2f}%/日")
+                    lines.append(f"  月化換手率估算: {turnover_monthly:.1f}%")
+                    if turnover_monthly > 30:
+                        lines.append("  ⚠️  換手率偏高，散戶頻繁進出")
+                    elif turnover_monthly > 10:
+                        lines.append("  → 換手率中等")
+                    else:
+                        lines.append("  ✓ 換手率偏低，持股穩定")
+                else:
+                    lines.append("  換手率: 流通股資料不足，無法計算")
+            else:
+                lines.append("  成交量資料不足")
+        except Exception as e:
+            lines.append(f"  成交量資料取得失敗: {str(e)}")
+
+        # 【持股結構】
+        lines.append("")
+        lines.append("【持股結構】")
+        inst_pct_val = None
+        insider_pct_val = None
+        retail_pct_val = None
+        try:
+            inst_pct_raw = info.get('heldPercentInstitutions')
+            insider_pct_raw = info.get('heldPercentInsiders')
+            inst_count = info.get('institutionsCount')
+
+            if inst_pct_raw is None:
+                try:
+                    mh = stock.major_holders
+                    if mh is not None and not mh.empty:
+                        def get_mh_val(key):
+                            if key in mh.index:
+                                return mh.loc[key].iloc[0]
+                            return None
+                        inst_pct_raw = get_mh_val('institutionsPercentHeld')
+                        if insider_pct_raw is None:
+                            insider_pct_raw = get_mh_val('insidersPercentHeld')
+                        if inst_count is None:
+                            inst_count = get_mh_val('institutionsCount')
+                except Exception:
+                    pass
+
+            if inst_pct_raw is not None:
+                inst_pct_val = float(inst_pct_raw) * 100
+                lines.append(f"  機構持股: {inst_pct_val:.2f}%")
+            else:
+                lines.append("  機構持股: 資料不足")
+
+            if insider_pct_raw is not None:
+                insider_pct_val = float(insider_pct_raw) * 100
+                lines.append(f"  內部人持股: {insider_pct_val:.2f}%")
+            else:
+                lines.append("  內部人持股: 資料不足")
+
+            if inst_count is not None:
+                lines.append(f"  機構家數: {int(float(inst_count))}")
+
+            if inst_pct_val is not None and insider_pct_val is not None:
+                retail_pct_val = max(0.0, 100.0 - inst_pct_val - insider_pct_val)
+                lines.append(f"  估算散戶持股: {retail_pct_val:.2f}% （= 100% − 機構 − 內部人）")
+            elif inst_pct_val is not None:
+                retail_pct_val = max(0.0, 100.0 - inst_pct_val)
+                lines.append(f"  估算散戶持股: {retail_pct_val:.2f}% （僅扣除機構）")
+            else:
+                lines.append("  估算散戶持股: 持股資料不足，無法計算")
+        except Exception as e:
+            lines.append(f"  持股結構資料取得失敗: {str(e)}")
+
+        # 【法人日交易參與率】（台股專用）
+        if is_taiwan:
+            lines.append("")
+            lines.append("【法人日交易參與率（台股）】")
+            try:
+                def get_recent_weekdays_va(n=10):
+                    days = []
+                    d = datetime.date.today()
+                    while len(days) < n:
+                        if d.weekday() < 5:
+                            days.append(d)
+                        d -= datetime.timedelta(days=1)
+                    return days
+
+                def parse_tw_amount(v):
+                    v = str(v).strip()
+                    if not v or v == '-':
+                        return None
+                    return int(v.replace(',', ''))
+
+                recent_dates_va = get_recent_weekdays_va(10)
+                participation_found = False
+
+                for d in recent_dates_va:
+                    date_str = d.strftime('%Y%m%d')
+                    try:
+                        url_inst = f"https://www.twse.com.tw/rwd/zh/fund/TWT44U?response=json&date={date_str}&stockNo={ticker_base}"
+                        resp_inst = httpx.get(url_inst, timeout=8, headers={"User-Agent": "Mozilla/5.0"})
+                        data_inst = resp_inst.json()
+
+                        if data_inst.get('stat') != 'OK':
+                            continue
+
+                        fields_inst = data_inst.get('fields', [])
+                        rows_inst = data_inst.get('data', [])
+                        if not rows_inst:
+                            continue
+
+                        buy_idx = None
+                        sell_idx = None
+                        for i, f in enumerate(fields_inst):
+                            if '買進' in f and '金額' in f:
+                                buy_idx = i
+                            if '賣出' in f and '金額' in f:
+                                sell_idx = i
+                        if buy_idx is None:
+                            buy_idx = 1
+                        if sell_idx is None:
+                            sell_idx = 2
+
+                        total_inst_buy = 0
+                        total_inst_sell = 0
+                        for row in rows_inst:
+                            b = parse_tw_amount(row[buy_idx]) if buy_idx < len(row) else None
+                            s = parse_tw_amount(row[sell_idx]) if sell_idx < len(row) else None
+                            if b is not None:
+                                total_inst_buy += b
+                            if s is not None:
+                                total_inst_sell += s
+
+                        total_inst_amount = total_inst_buy + total_inst_sell
+                        if total_inst_amount == 0:
+                            continue
+
+                        url_day = f"https://www.twse.com.tw/exchangeReport/STOCK_DAY?response=json&date={date_str}&stockNo={ticker_base}"
+                        resp_day = httpx.get(url_day, timeout=8, headers={"User-Agent": "Mozilla/5.0"})
+                        data_day = resp_day.json()
+
+                        if data_day.get('stat') != 'OK':
+                            continue
+
+                        fields_day = data_day.get('fields', [])
+                        rows_day = data_day.get('data', [])
+                        if not rows_day:
+                            continue
+
+                        amount_idx = None
+                        for i, f in enumerate(fields_day):
+                            if '成交金額' in f:
+                                amount_idx = i
+                                break
+                        if amount_idx is None:
+                            amount_idx = 2
+
+                        tw_year = d.year - 1911
+                        tw_date_str = f"{tw_year}/{d.month:02d}/{d.day:02d}"
+                        target_row = None
+                        for row in rows_day:
+                            if row and row[0] == tw_date_str:
+                                target_row = row
+                                break
+                        if target_row is None:
+                            target_row = rows_day[-1]
+
+                        total_amount_raw = parse_tw_amount(target_row[amount_idx]) if amount_idx < len(target_row) else None
+                        if total_amount_raw is None or total_amount_raw == 0:
+                            continue
+
+                        inst_pct_trade = total_inst_amount / total_amount_raw * 100
+                        retail_pct_trade = 100.0 - inst_pct_trade
+
+                        def fmt_tw_amt(v):
+                            if v >= 1e8:
+                                return f"{v / 1e8:.2f}億"
+                            elif v >= 1e4:
+                                return f"{v / 1e4:.0f}萬"
+                            return f"{v:,.0f}"
+
+                        lines.append(f"  資料日期: {d.strftime('%Y-%m-%d')}")
+                        lines.append(f"  法人買進金額: {fmt_tw_amt(total_inst_buy)}")
+                        lines.append(f"  法人賣出金額: {fmt_tw_amt(total_inst_sell)}")
+                        lines.append(f"  法人交易總額: {fmt_tw_amt(total_inst_amount)}")
+                        lines.append(f"  當日總成交金額: {fmt_tw_amt(total_amount_raw)}")
+                        lines.append(f"  法人參與率: {inst_pct_trade:.1f}%")
+                        lines.append(f"  估算散戶參與率: {retail_pct_trade:.1f}%")
+                        if inst_pct_trade < 20:
+                            lines.append("  ⚠️  法人參與率偏低（< 20%），散戶主導")
+                        elif inst_pct_trade > 50:
+                            lines.append("  ✓ 法人參與率高（> 50%），法人主導")
+                        participation_found = True
+                        break
+
+                    except Exception:
+                        continue
+
+                if not participation_found:
+                    lines.append("  無法取得 TWT44U 法人參與率資料，顯示 T86 淨買賣超：")
+                    try:
+                        for d in recent_dates_va[:5]:
+                            date_str = d.strftime('%Y%m%d')
+                            url_t86 = f"https://www.twse.com.tw/rwd/zh/fund/T86?response=json&date={date_str}&selectType=ALL"
+                            resp = httpx.get(url_t86, timeout=8, headers={"User-Agent": "Mozilla/5.0"})
+                            data = resp.json()
+                            if data.get('stat') != 'OK':
+                                continue
+                            fields = data.get('fields', [])
+                            rows = data.get('data', [])
+                            for row in rows:
+                                if row and row[0] == ticker_base:
+                                    total_idx = None
+                                    for i, f in enumerate(fields):
+                                        if '三大法人' in f and '買賣超' in f:
+                                            total_idx = i
+                                            break
+                                    if total_idx is not None and total_idx < len(row):
+                                        lines.append(f"  {d.strftime('%Y-%m-%d')} 三大法人淨買超: {row[total_idx]} 股（無法精確計算參與率）")
+                                    break
+                            break
+                    except Exception:
+                        lines.append("  法人備援資料取得失敗")
+
+            except Exception as e:
+                lines.append(f"  台股法人參與率計算失敗: {str(e)}")
+
+        # 【散戶投機指標】（非台股）
+        else:
+            lines.append("")
+            lines.append("【散戶投機指標（美股）】")
+            try:
+                short_ratio = info.get('shortRatio')
+                short_pct_float = info.get('shortPercentOfFloat')
+                shares_short = info.get('sharesShort')
+
+                if short_ratio is not None:
+                    if short_ratio > 7:
+                        short_state = "⚠️  高度投機（> 7 天）"
+                    elif short_ratio > 3:
+                        short_state = "→ 偏高（> 3 天）"
+                    else:
+                        short_state = "✓ 正常"
+                    lines.append(f"  空頭比率 (Days to Cover): {short_ratio:.1f} 天 → {short_state}")
+                else:
+                    lines.append("  空頭比率: 資料不足")
+
+                if short_pct_float is not None:
+                    lines.append(f"  空頭佔流通股: {short_pct_float * 100:.2f}%")
+
+                if shares_short is not None:
+                    s = float(shares_short)
+                    if s >= 1e9:
+                        s_str = f"{s / 1e9:.2f}B 股"
+                    elif s >= 1e6:
+                        s_str = f"{s / 1e6:.2f}M 股"
+                    else:
+                        s_str = f"{int(s):,} 股"
+                    lines.append(f"  空頭持倉: {s_str}")
+
+                if short_ratio is None and short_pct_float is None:
+                    lines.append("  無空頭資料（可能為 ETF 或非美股）")
+            except Exception as e:
+                lines.append(f"  投機指標資料取得失敗: {str(e)}")
+
+        # 【散戶集中度評估】
+        lines.append("")
+        lines.append("【散戶集中度評估】")
+        try:
+            score_retail = 0
+            score_total = 0
+            eval_signals = []
+
+            if retail_pct_val is not None:
+                score_total += 1
+                if retail_pct_val > 60:
+                    score_retail += 1
+                    eval_signals.append(f"  ⚠️  散戶估算持股 {retail_pct_val:.1f}% > 60%（偏高）")
+                else:
+                    eval_signals.append(f"  ✓ 散戶估算持股 {retail_pct_val:.1f}%（正常）")
+
+            float_shares = info.get('floatShares')
+            if float_shares and float_shares > 0 and ma10_vol is not None and ma10_vol > 0:
+                turnover_monthly = ma10_vol / float_shares * 100 * 21
+                score_total += 1
+                if turnover_monthly > 30:
+                    score_retail += 1
+                    eval_signals.append(f"  ⚠️  月化換手率 {turnover_monthly:.1f}% > 30%（散戶頻繁進出）")
+                else:
+                    eval_signals.append(f"  ✓ 月化換手率 {turnover_monthly:.1f}%（正常）")
+
+            if not is_taiwan:
+                short_ratio = info.get('shortRatio')
+                if short_ratio is not None:
+                    score_total += 1
+                    if short_ratio > 5:
+                        score_retail += 1
+                        eval_signals.append(f"  ⚠️  空頭比率 {short_ratio:.1f} 天 > 5（投機偏高）")
+                    else:
+                        eval_signals.append(f"  ✓ 空頭比率 {short_ratio:.1f} 天（正常）")
+
+            for s in eval_signals:
+                lines.append(s)
+
+            if score_total > 0:
+                lines.append("")
+                retail_ratio = score_retail / score_total
+                if retail_ratio >= 0.5:
+                    lines.append("  → 綜合結論：散戶比例偏高 ⚠️  — 建議謹慎，法人參與度較低")
+                elif retail_ratio > 0:
+                    lines.append("  → 綜合結論：法人/散戶混合 → — 中性，建議搭配其他指標判斷")
+                else:
+                    lines.append("  → 綜合結論：法人主導 ✓ — 符合法人偏好標的特徵")
+            else:
+                lines.append("  資料不足，無法評估散戶集中度")
+
+        except Exception as e:
+            lines.append(f"  散戶集中度評估失敗: {str(e)}")
+
+        return "\n".join(lines)
+    except Exception as e:
+        return f"無法取得 {ticker} 的交易量分析: {str(e)}"
+
+
+@mcp.tool()
 def get_stock_report(ticker: str) -> str:
     """
     綜合投資報告：整合估值、技術面、基本面、股息分析，輸出完整參考報告。
@@ -1280,6 +1654,20 @@ def get_stock_report(ticker: str) -> str:
 
         if div_yield and div_yield >= 0.04:
             signals.append(("殖利率", "高殖利率", "+"))
+
+        try:
+            inst_pct_report = info.get('heldPercentInstitutions')
+            insider_pct_report = info.get('heldPercentInsiders')
+            if inst_pct_report is not None and insider_pct_report is not None:
+                inst_pct_f = float(inst_pct_report) * 100
+                insider_pct_f = float(insider_pct_report) * 100
+                retail_pct_f = max(0.0, 100.0 - inst_pct_f - insider_pct_f)
+                if retail_pct_f > 60:
+                    signals.append(("持股結構", "散戶比例偏高", "-"))
+                elif inst_pct_f > 60:
+                    signals.append(("持股結構", "法人主導", "+"))
+        except Exception:
+            pass
 
         if signals:
             for category, desc, sign in signals:
