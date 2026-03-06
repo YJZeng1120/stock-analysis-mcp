@@ -6,7 +6,7 @@ import httpx
 from duckduckgo_search import DDGS
 
 # 建立 MCP Server 實例
-mcp = FastMCP("stock-analysis-mcp")
+mcp = FastMCP("stock-analysis-mcp", stateless_http=True, json_response=True)
 
 
 @mcp.tool()
@@ -1695,4 +1695,4 @@ def get_stock_report(ticker: str) -> str:
 
 
 if __name__ == "__main__":
-    mcp.run()
+    mcp.run(transport="stdio")
