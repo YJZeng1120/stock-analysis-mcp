@@ -1,12 +1,15 @@
-from mcp.server.fastmcp import FastMCP
-import yfinance as yf
-import math
 import datetime
+import math
+import os
+
 import httpx
+import yfinance as yf
 from duckduckgo_search import DDGS
+from mcp.server.fastmcp import FastMCP
 
 # 建立 MCP Server 實例
-mcp = FastMCP("stock-analysis-mcp", stateless_http=True, json_response=True)
+_host = os.environ.get("FASTMCP_HOST", "127.0.0.1")
+mcp = FastMCP("stock-analysis-mcp", stateless_http=True, json_response=True, host=_host)
 
 
 @mcp.tool()
@@ -1695,4 +1698,8 @@ def get_stock_report(ticker: str) -> str:
 
 
 if __name__ == "__main__":
-    mcp.run()
+    import os
+    if os.environ.get("MCP_TRANSPORT") == "http":
+        mcp.run(transport="streamable-http")
+    else:
+        mcp.run()

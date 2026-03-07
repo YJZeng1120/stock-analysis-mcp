@@ -15,6 +15,12 @@ RUN uv sync --frozen --no-install-project
 COPY finance.py ./
 
 ENV PYTHONUNBUFFERED=1
+ENV MCP_TRANSPORT=http
+ENV FASTMCP_HOST=0.0.0.0
+ENV FASTMCP_PORT=8000
 
-# MCP stdio: reads from stdin, writes to stdout
+EXPOSE 8000
+
+# Default: HTTP transport for external access via ngrok
+# For local stdio mode: docker run --rm -i -e MCP_TRANSPORT=stdio stock-analysis-mcp:latest
 CMD ["uv", "run", "--no-sync", "python", "finance.py"]

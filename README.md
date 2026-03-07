@@ -45,7 +45,7 @@ docker build -t stock-analysis-mcp .
 #### 2. 測試 Container 是否正常啟動
 
 ```bash
-docker run --rm -i stock-analysis-mcp
+docker run --rm -i -e MCP_TRANSPORT=stdio stock-analysis-mcp:latest
 ```
 
 > 啟動後會等待 stdin 輸入（MCP stdio 模式），`Ctrl+C` 結束即可。
@@ -60,7 +60,7 @@ docker run --rm -i stock-analysis-mcp
     "stock-analysis": {
       "type": "stdio",
       "command": "docker",
-      "args": ["run", "--rm", "-i", "stock-analysis-mcp:latest"]
+      "args": ["run", "--rm", "-i", "-e", "MCP_TRANSPORT=stdio", "stock-analysis-mcp:latest"]
     }
   }
 }
@@ -73,6 +73,57 @@ docker run --rm -i stock-analysis-mcp
 ```bash
 docker build -t stock-analysis-mcp .
 ```
+
+### 方式三：Docker + ngrok 對外公開（遠端存取）
+
+**前置需求**：Docker、[ngrok](https://ngrok.com)（需登入帳號）
+
+#### 1. 建構 Image
+
+```bash
+docker build -t stock-analysis-mcp:latest .
+```
+
+#### 2. 啟動 HTTP 模式 Container
+
+```bash
+docker run --rm -p 8000:8000 stock-analysis-mcp:latest
+```
+
+看到以下訊息即表示成功：
+
+```
+INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
+```
+
+#### 3. 開另一個 Terminal，啟動 ngrok
+
+```bash
+ngrok http 8000
+```
+
+ngrok 會顯示對外 URL，例如：
+
+```
+Forwarding  https://xxxx-xxx-xxx.ngrok-free.app -> http://localhost:8000
+```
+
+#### 4. 設定 MCP Client
+
+在 `.mcp.json`（或 `claude_desktop_config.json`）加入，URL 結尾必須加 `/mcp`：
+
+```json
+{
+  "mcpServers": {
+    "stock-analysis": {
+      "type": "http",
+      "url": "https://xxxx-xxx-xxx.ngrok-free.app/mcp"
+    }
+  }
+}
+```
+
+> **注意**：ngrok 免費版每次重啟 URL 都會改變，需同步更新 client config。
 
 ---
 
