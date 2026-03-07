@@ -19,22 +19,7 @@
 
 ## 使用方式
 
-### 方式一：本地直接執行
-
-**前置需求**：Python ≥ 3.14、[uv](https://github.com/astral-sh/uv)
-
-```bash
-# 安裝依賴
-uv sync
-
-# 啟動 MCP Server
-uv run finance.py
-
-# 用 MCP Inspector 互動測試
-uv run mcp dev finance.py
-```
-
-### 方式二：Docker 執行（推薦）
+### 方式一：Docker 本地執行
 
 #### 1. 建構 Image
 
@@ -66,15 +51,7 @@ docker run --rm -i -e MCP_TRANSPORT=stdio stock-analysis-mcp:latest
 }
 ```
 
-#### 更新 Image
-
-修改程式碼後重新 build 即可：
-
-```bash
-docker build -t stock-analysis-mcp .
-```
-
-### 方式三：Docker + ngrok 對外公開（遠端存取）
+### 方式二：Docker + ngrok 對外公開（遠端存取）
 
 **前置需求**：Docker、[ngrok](https://ngrok.com)（需登入帳號）
 
@@ -125,18 +102,3 @@ Forwarding  https://xxxx-xxx-xxx.ngrok-free.app -> http://localhost:8000
 
 > **注意**：ngrok 免費版每次重啟 URL 都會改變，需同步更新 client config。
 
----
-
-## 本地開發設定（uv + MCP Client）
-
-```json
-{
-  "mcpServers": {
-    "stock-analysis": {
-      "type": "stdio",
-      "command": "uv",
-      "args": ["--directory", "/absolute/path/to/stock-analysis-mcp", "run", "finance.py"]
-    }
-  }
-}
-```
